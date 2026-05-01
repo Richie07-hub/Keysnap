@@ -1,859 +1,495 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>KeySnap — Live Key Detector</title>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+import { useState, useEffect, useRef, useCallback } from "react";
 
-  :root {
-    --bg: #0a0a0f;
-    --surface: #111118;
-    --surface2: #1a1a24;
-    --border: rgba(255,255,255,0.07);
-    --border2: rgba(255,255,255,0.13);
-    --accent: #00e5a0;
-    --accent2: #00b87a;
-    --accent-dim: rgba(0,229,160,0.12);
-    --accent-glow: rgba(0,229,160,0.25);
-    --text: #f0f0f5;
-    --text2: #8888a0;
-    --text3: #555568;
-    --danger: #ff4d6d;
-    --warn: #ffb347;
-    --font-display: 'Syne', sans-serif;
-    --font-mono: 'DM Mono', monospace;
-  }
+// ── Pitch detection via autocorrelation (YIN-inspired) ──────────────────────
+function detectPitch(buffer, sampleRate) {
+  const SIZE = buffer.length;
+  const MAX_SAMPLES = Math.floor(SIZE / 2);
+  let bestOffset = -1;
+  let bestCorrelation = 0;
+  let rms = 0;
 
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font-display);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 0 16px 60px;
-    overflow-x: hidden;
+  for (let i = 0; i < SIZE; i++) rms += buffer[i] * buffer[i];
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.01) return null;
+
+  let lastCorrelation = 1;
+  for (let offset = 0; offset < MAX_SAMPLES; offset++) {
+    let correlation = 0;
+    for (let i = 0; i < MAX_SAMPLES; i++) {
+      correlation += Math.abs(buffer[i] - buffer[i + offset]);
+    }
+    correlation = 1 - correlation / MAX_SAMPLES;
+    if (correlation > 0.9 && correlation > lastCorrelation) {
+      bestCorrelation = correlation;
+      bestOffset = offset;
+    }
+    if (correlation > bestCorrelation) {
+      bestCorrelation = correlation;
+      bestOffset = offset;
+    }
+    lastCorrelation = correlation;
   }
 
-  /* subtle grid bg */
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background-image:
-      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
-    background-size: 40px 40px;
-    pointer-events: none;
-    z-index: 0;
+  if (bestCorrelation > 0.01 && bestOffset > 0) {
+    return sampleRate / bestOffset;
   }
-
-  .container { position: relative; z-index: 1; width: 100%; max-width: 480px; }
-
-  /* ── HEADER ── */
-  header {
-    text-align: center;
-    padding: 48px 0 32px;
-  }
-  .logo {
-    font-size: 13px;
-    letter-spacing: 0.3em;
-    color: var(--accent);
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-    margin-bottom: 8px;
-  }
-  h1 {
-    font-size: 52px;
-    font-weight: 800;
-    letter-spacing: -2px;
-    line-height: 1;
-    color: var(--text);
-  }
-  h1 span { color: var(--accent); }
-
-  /* ── WAVEFORM ── */
-  .waveform-wrap {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 16px;
-    margin-bottom: 16px;
-    position: relative;
-    overflow: hidden;
-  }
-  .waveform-wrap::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    border-radius: 20px;
-    box-shadow: inset 0 0 0 1px var(--border2);
-    pointer-events: none;
-  }
-  #waveCanvas {
-    width: 100%;
-    height: 80px;
-    display: block;
-  }
-
-  /* ── BIG KEY DISPLAY ── */
-  .key-display {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 32px 24px 24px;
-    margin-bottom: 16px;
-    text-align: center;
-    position: relative;
-    overflow: hidden;
-    transition: border-color 0.3s;
-  }
-  .key-display.active { border-color: var(--accent-glow); }
-  .key-display::before {
-    content: '';
-    position: absolute;
-    top: -60px; left: 50%; transform: translateX(-50%);
-    width: 200px; height: 200px;
-    background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.5s;
-  }
-  .key-display.active::before { opacity: 1; }
-
-  .key-label {
-    font-size: 11px;
-    letter-spacing: 0.25em;
-    color: var(--text3);
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-    margin-bottom: 12px;
-  }
-  .key-name {
-    font-size: 80px;
-    font-weight: 800;
-    letter-spacing: -3px;
-    line-height: 1;
-    color: var(--text);
-    transition: color 0.3s;
-    min-height: 80px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .key-name.has-key { color: var(--accent); }
-  .key-quality {
-    font-size: 18px;
-    font-weight: 400;
-    color: var(--text2);
-    margin-top: 4px;
-    letter-spacing: 0.05em;
-    min-height: 24px;
-  }
-
-  /* confidence bar */
-  .conf-wrap { margin-top: 20px; }
-  .conf-header {
-    display: flex;
-    justify-content: space-between;
-    font-size: 11px;
-    font-family: var(--font-mono);
-    color: var(--text3);
-    margin-bottom: 6px;
-  }
-  .conf-value { color: var(--accent); font-weight: 500; }
-  .conf-track {
-    height: 4px;
-    background: var(--surface2);
-    border-radius: 99px;
-    overflow: hidden;
-  }
-  .conf-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 99px;
-    width: 0%;
-    transition: width 0.3s ease;
-  }
-
-  /* ── INFO CARDS GRID ── */
-  .info-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    margin-bottom: 16px;
-  }
-  .info-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 16px;
-  }
-  .info-card-label {
-    font-size: 10px;
-    letter-spacing: 0.2em;
-    color: var(--text3);
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-    margin-bottom: 10px;
-  }
-  .scale-notes {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-  }
-  .note-pill {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 4px 8px;
-    font-size: 12px;
-    font-family: var(--font-mono);
-    color: var(--text2);
-    transition: all 0.2s;
-  }
-  .note-pill.root {
-    background: var(--accent-dim);
-    border-color: var(--accent);
-    color: var(--accent);
-    font-weight: 500;
-  }
-  .chord-list {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-  }
-  .chord-item {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 12px;
-    font-family: var(--font-mono);
-  }
-  .chord-name { color: var(--text); }
-  .chord-roman { color: var(--text3); font-size: 11px; }
-
-  /* ── CHROMAGRAM ── */
-  .chromagram-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 16px;
-    margin-bottom: 16px;
-  }
-  .chroma-label {
-    font-size: 10px;
-    letter-spacing: 0.2em;
-    color: var(--text3);
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-    margin-bottom: 12px;
-  }
-  .chroma-bars {
-    display: flex;
-    gap: 4px;
-    align-items: flex-end;
-    height: 60px;
-  }
-  .chroma-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; }
-  .chroma-bar {
-    width: 100%;
-    background: var(--surface2);
-    border-radius: 3px 3px 0 0;
-    transition: height 0.12s ease, background 0.2s;
-    min-height: 2px;
-  }
-  .chroma-bar.active { background: var(--accent); }
-  .chroma-note {
-    font-size: 9px;
-    font-family: var(--font-mono);
-    color: var(--text3);
-    text-align: center;
-  }
-  .chroma-note.active { color: var(--accent); }
-
-  /* ── BUTTONS ── */
-  .btn-row {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 16px;
-  }
-  .btn {
-    flex: 1;
-    padding: 16px;
-    border-radius: 14px;
-    border: 1px solid var(--border2);
-    background: transparent;
-    color: var(--text);
-    font-family: var(--font-display);
-    font-size: 14px;
-    font-weight: 700;
-    cursor: pointer;
-    letter-spacing: 0.03em;
-    transition: all 0.15s;
-    position: relative;
-    overflow: hidden;
-  }
-  .btn:hover { border-color: var(--accent); color: var(--accent); }
-  .btn-primary {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #000;
-  }
-  .btn-primary:hover { background: var(--accent2); border-color: var(--accent2); color: #000; }
-  .btn:disabled { opacity: 0.35; cursor: not-allowed; }
-  .btn.recording {
-    background: var(--danger);
-    border-color: var(--danger);
-    color: #fff;
-    animation: pulse-btn 1.4s infinite;
-  }
-  @keyframes pulse-btn {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(255,77,109,0.4); }
-    50% { box-shadow: 0 0 0 8px rgba(255,77,109,0); }
-  }
-
-  /* ── HISTORY ── */
-  .history-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 16px;
-  }
-  .history-header {
-    font-size: 10px;
-    letter-spacing: 0.2em;
-    color: var(--text3);
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-    margin-bottom: 12px;
-  }
-  .history-list { display: flex; flex-direction: column; gap: 6px; }
-  .history-item {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 8px 10px;
-    background: var(--surface2);
-    border-radius: 8px;
-    font-size: 13px;
-  }
-  .hist-key { font-weight: 700; color: var(--accent); font-family: var(--font-mono); }
-  .hist-meta { color: var(--text3); font-size: 11px; font-family: var(--font-mono); }
-  .history-empty { color: var(--text3); font-size: 12px; font-family: var(--font-mono); text-align: center; padding: 12px 0; }
-
-  /* ── STATUS ── */
-  .status-dot {
-    display: inline-block;
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: var(--text3);
-    margin-right: 6px;
-    vertical-align: middle;
-    transition: background 0.3s;
-  }
-  .status-dot.live { background: var(--accent); animation: blink 1s infinite; }
-  .status-dot.locked { background: var(--warn); }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-  .status-row {
-    font-size: 11px;
-    font-family: var(--font-mono);
-    color: var(--text3);
-    text-align: center;
-    margin-bottom: 16px;
-  }
-
-  .locked-badge {
-    display: inline-block;
-    background: rgba(255,179,71,0.15);
-    border: 1px solid var(--warn);
-    color: var(--warn);
-    font-size: 10px;
-    font-family: var(--font-mono);
-    padding: 3px 8px;
-    border-radius: 6px;
-    margin-left: 8px;
-    letter-spacing: 0.1em;
-    vertical-align: middle;
-    display: none;
-  }
-  .locked-badge.show { display: inline-block; }
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <div class="logo">KeySnap</div>
-    <h1>Live Key<span>.</span></h1>
-  </header>
-
-  <!-- Waveform -->
-  <div class="waveform-wrap">
-    <canvas id="waveCanvas"></canvas>
-  </div>
-
-  <!-- Status -->
-  <div class="status-row">
-    <span class="status-dot" id="statusDot"></span>
-    <span id="statusText">tap start to begin listening</span>
-    <span class="locked-badge" id="lockedBadge">LOCKED</span>
-  </div>
-
-  <!-- Big key display -->
-  <div class="key-display" id="keyDisplay">
-    <div class="key-label">Detected Key</div>
-    <div class="key-name" id="keyName">—</div>
-    <div class="key-quality" id="keyQuality"></div>
-    <div class="conf-wrap">
-      <div class="conf-header">
-        <span>confidence</span>
-        <span class="conf-value" id="confVal">0%</span>
-      </div>
-      <div class="conf-track"><div class="conf-fill" id="confFill"></div></div>
-    </div>
-  </div>
-
-  <!-- Info grid: scale + chords -->
-  <div class="info-grid">
-    <div class="info-card">
-      <div class="info-card-label">Scale Notes</div>
-      <div class="scale-notes" id="scaleNotes">
-        <span class="note-pill">—</span>
-      </div>
-    </div>
-    <div class="info-card">
-      <div class="info-card-label">Chords in Key</div>
-      <div class="chord-list" id="chordList">
-        <div class="chord-item"><span class="chord-name" style="color:var(--text3)">—</span></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Chromagram -->
-  <div class="chromagram-card">
-    <div class="chroma-label">Chromagram — pitch class energy</div>
-    <div class="chroma-bars" id="chromaBars"></div>
-  </div>
-
-  <!-- Buttons -->
-  <div class="btn-row">
-    <button class="btn btn-primary" id="startBtn" onclick="toggleListen()">Start Listening</button>
-    <button class="btn" id="lockBtn" onclick="toggleLock()" disabled>Hold Key</button>
-  </div>
-
-  <!-- History -->
-  <div class="history-card">
-    <div class="history-header">session history</div>
-    <div class="history-list" id="historyList">
-      <div class="history-empty">no detections yet</div>
-    </div>
-  </div>
-</div>
-
-<script>
-// ═══════════════════════════════════════════════
-//  KEYSNAP — Musical Key Detection Algorithm
-//  Method: Chromagram + Krumhansl-Schmuckler
-// ═══════════════════════════════════════════════
-
-const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-const ENHARMONIC = {'C#':'Db','D#':'Eb','F#':'Gb','G#':'Ab','A#':'Bb'};
-
-// Krumhansl-Schmuckler key profiles (major & minor)
-const KS_MAJOR = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
-const KS_MINOR = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17];
-
-// Diatonic scales
-const MAJOR_STEPS = [0,2,4,5,7,9,11];
-const MINOR_STEPS = [0,2,3,5,7,8,10];
-
-// Chords in major key: I ii iii IV V vi vii°
-const MAJOR_CHORDS = [
-  ['I','maj'],['ii','min'],['iii','min'],['IV','maj'],
-  ['V','maj'],['vi','min'],['vii°','dim']
-];
-const MINOR_CHORDS = [
-  ['i','min'],['ii°','dim'],['III','maj'],['iv','min'],
-  ['V','maj'],['VI','maj'],['VII','maj']
-];
-const CHORD_OFFSETS_MAJ = [0,2,4,5,7,9,11];
-const CHORD_OFFSETS_MIN = [0,2,3,5,7,8,10];
-
-// ── Audio state ──
-let audioCtx = null, analyser = null, stream = null;
-let animFrame = null, isListening = false, isLocked = false;
-let lockedKey = null;
-let smoothChroma = new Float32Array(12).fill(0);
-let detectionBuffer = []; // rolling last 1s of detections
-let lastAddedKey = null;
-let sessionHistory = [];
-
-// ── DOM ──
-const startBtn = document.getElementById('startBtn');
-const lockBtn  = document.getElementById('lockBtn');
-const keyName  = document.getElementById('keyName');
-const keyQuality = document.getElementById('keyQuality');
-const confFill = document.getElementById('confFill');
-const confVal  = document.getElementById('confVal');
-const scaleNotes = document.getElementById('scaleNotes');
-const chordList  = document.getElementById('chordList');
-const historyList = document.getElementById('historyList');
-const statusDot  = document.getElementById('statusDot');
-const statusText = document.getElementById('statusText');
-const lockedBadge = document.getElementById('lockedBadge');
-const keyDisplay = document.getElementById('keyDisplay');
-const waveCanvas = document.getElementById('waveCanvas');
-const chromaBarsEl = document.getElementById('chromaBars');
-
-// Build chromagram bars
-let chromaBarEls = [], chromaNoteEls = [];
-NOTE_NAMES.forEach((n,i) => {
-  const col = document.createElement('div');
-  col.className = 'chroma-col';
-  const bar = document.createElement('div');
-  bar.className = 'chroma-bar';
-  bar.style.height = '2px';
-  const lbl = document.createElement('div');
-  lbl.className = 'chroma-note';
-  lbl.textContent = n;
-  col.appendChild(bar);
-  col.appendChild(lbl);
-  chromaBarsEl.appendChild(col);
-  chromaBarEls.push(bar);
-  chromaNoteEls.push(lbl);
-});
-
-// Setup waveform canvas
-const dpr = window.devicePixelRatio || 1;
-waveCanvas.width  = waveCanvas.offsetWidth  * dpr;
-waveCanvas.height = waveCanvas.offsetHeight * dpr;
-const wCtx = waveCanvas.getContext('2d');
-wCtx.scale(dpr, dpr);
-const WW = waveCanvas.offsetWidth;
-const WH = waveCanvas.offsetHeight;
-
-// ── STEP 1: FFT → Chromagram ──────────────────
-function buildChromagram(floatFreqData, sampleRate, fftSize) {
-  const chroma = new Float32Array(12).fill(0);
-  const nyquist = sampleRate / 2;
-  const binWidth = nyquist / (fftSize / 2);
-
-  // C2 to B6 — musically useful range
-  const freqMin = 65.41;
-  const freqMax = 1975.53;
-
-  for (let i = 1; i < floatFreqData.length; i++) {
-    const freq = i * binWidth;
-    if (freq < freqMin || freq > freqMax) continue;
-
-    // Convert power (dB) to linear amplitude
-    const amp = Math.pow(10, floatFreqData[i] / 20);
-    if (amp < 1e-6) continue;
-
-    // Map freq → MIDI note → pitch class (0–11)
-    const midi = 12 * Math.log2(freq / 440) + 69;
-    const pc   = ((Math.round(midi) % 12) + 12) % 12;
-    chroma[pc] += amp;
-  }
-
-  // Normalize 0–1
-  const maxVal = Math.max(...chroma, 1e-9);
-  for (let i = 0; i < 12; i++) chroma[i] /= maxVal;
-  return chroma;
+  return null;
 }
 
-// ── STEP 2: Smooth chromagram (EMA) ──────────
-function smoothChromaUpdate(raw) {
-  const alpha = 0.25;
-  for (let i = 0; i < 12; i++) {
-    smoothChroma[i] = alpha * raw[i] + (1 - alpha) * smoothChroma[i];
-  }
+// ── Frequency → MIDI note number ─────────────────────────────────────────────
+function freqToMidi(freq) {
+  return Math.round(12 * Math.log2(freq / 440) + 69);
 }
 
-// ── STEP 3: Pearson correlation with KS profiles ──
-function pearson(a, b) {
-  const n = a.length;
-  let sumA=0, sumB=0, sumAB=0, sumA2=0, sumB2=0;
-  for (let i=0;i<n;i++){
-    sumA+=a[i]; sumB+=b[i]; sumAB+=a[i]*b[i];
-    sumA2+=a[i]*a[i]; sumB2+=b[i]*b[i];
-  }
-  const num = n*sumAB - sumA*sumB;
-  const den = Math.sqrt((n*sumA2-sumA*sumA)*(n*sumB2-sumB*sumB));
-  return den < 1e-9 ? 0 : num/den;
+// ── MIDI → pitch class (0=C … 11=B) ─────────────────────────────────────────
+function midiToPitchClass(midi) {
+  return ((midi % 12) + 12) % 12;
 }
 
-// ── STEP 4: Detect key ────────────────────────
-function detectKey(chroma) {
-  let bestScore = -Infinity, bestRoot = 0, bestQuality = 'major';
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
+// ── Krumhansl-Schmuckler key profiles ────────────────────────────────────────
+const KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
+function correlate(histogram, profile) {
+  const n = 12;
+  const meanH = histogram.reduce((a, b) => a + b, 0) / n;
+  const meanP = profile.reduce((a, b) => a + b, 0) / n;
+  let num = 0, denH = 0, denP = 0;
+  for (let i = 0; i < n; i++) {
+    const h = histogram[i] - meanH;
+    const p = profile[i] - meanP;
+    num += h * p;
+    denH += h * h;
+    denP += p * p;
+  }
+  return num / Math.sqrt(denH * denP + 1e-10);
+}
+
+function estimateKey(histogram) {
+  let best = { score: -Infinity, root: 0, quality: "major" };
   for (let root = 0; root < 12; root++) {
-    // Rotate chroma to align with this root
-    const rotated = [];
-    for (let i=0;i<12;i++) rotated.push(chroma[(i+root)%12]);
-
-    const majScore = pearson(rotated, KS_MAJOR);
-    const minScore = pearson(rotated, KS_MINOR);
-
-    if (majScore > bestScore) { bestScore=majScore; bestRoot=root; bestQuality='major'; }
-    if (minScore > bestScore) { bestScore=minScore; bestRoot=root; bestQuality='minor'; }
+    const rotated = [...histogram.slice(root), ...histogram.slice(0, root)];
+    const majScore = correlate(rotated, KS_MAJOR);
+    const minScore = correlate(rotated, KS_MINOR);
+    if (majScore > best.score) best = { score: majScore, root, quality: "major" };
+    if (minScore > best.score) best = { score: minScore, root, quality: "minor" };
   }
-
-  // Confidence: map score (typically 0.5–1.0) → 0–100%
-  const confidence = Math.min(100, Math.max(0, Math.round((bestScore - 0.3) / 0.7 * 100)));
-  return { root: bestRoot, quality: bestQuality, score: bestScore, confidence };
+  return best;
 }
 
-// ── STEP 5: Rolling majority vote (stability) ─
-function stableKey(result) {
-  detectionBuffer.push(`${result.root}:${result.quality}`);
-  if (detectionBuffer.length > 20) detectionBuffer.shift();
+// ── Visualizer canvas ─────────────────────────────────────────────────────────
+function WaveformCanvas({ analyserRef, isListening }) {
+  const canvasRef = useRef(null);
+  const animRef = useRef(null);
 
-  const counts = {};
-  for (const k of detectionBuffer) counts[k] = (counts[k]||0)+1;
-  const top = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0];
-  const [rootStr, quality] = top[0].split(':');
-  const root = parseInt(rootStr);
-  const stability = Math.round(top[1]/detectionBuffer.length * 100);
-  return { root, quality, stability, rawConfidence: result.confidence };
+  useEffect(() => {
+    if (!isListening || !analyserRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    const analyser = analyserRef.current;
+    const bufferLen = analyser.frequencyBinCount;
+    const dataArr = new Uint8Array(bufferLen);
+
+    const draw = () => {
+      animRef.current = requestAnimationFrame(draw);
+      analyser.getByteTimeDomainData(dataArr);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Gradient line
+      const grad = ctx.createLinearGradient(0, 0, canvas.width, 0);
+      grad.addColorStop(0, "#00ffa3");
+      grad.addColorStop(0.5, "#00d4ff");
+      grad.addColorStop(1, "#00ffa3");
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = grad;
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = "#00ffa3";
+      ctx.beginPath();
+
+      const sliceW = canvas.width / bufferLen;
+      let x = 0;
+      for (let i = 0; i < bufferLen; i++) {
+        const v = dataArr[i] / 128.0;
+        const y = (v * canvas.height) / 2;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        x += sliceW;
+      }
+      ctx.lineTo(canvas.width, canvas.height / 2);
+      ctx.stroke();
+    };
+    draw();
+    return () => cancelAnimationFrame(animRef.current);
+  }, [isListening, analyserRef]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={600}
+      height={80}
+      style={{ width: "100%", height: "80px", borderRadius: "8px", background: "rgba(0,255,163,0.03)", border: "1px solid rgba(0,255,163,0.1)" }}
+    />
+  );
 }
 
-// ── UI helpers ────────────────────────────────
-function formatNoteName(pc) {
-  const n = NOTE_NAMES[pc];
-  return ENHARMONIC[n] || n;
+// ── Chromagram bar ────────────────────────────────────────────────────────────
+function Chromagram({ histogram, detectedKey }) {
+  const max = Math.max(...histogram, 1);
+  return (
+    <div style={{ display: "flex", gap: "4px", alignItems: "flex-end", height: "60px" }}>
+      {histogram.map((val, i) => {
+        const isRoot = detectedKey && i === detectedKey.root;
+        const height = Math.round((val / max) * 56) + 4;
+        return (
+          <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
+            <div style={{
+              width: "100%",
+              height: `${height}px`,
+              background: isRoot ? "linear-gradient(180deg,#00ffa3,#00d4ff)" : "rgba(255,255,255,0.12)",
+              borderRadius: "3px 3px 0 0",
+              transition: "height 0.3s ease",
+              boxShadow: isRoot ? "0 0 10px rgba(0,255,163,0.5)" : "none"
+            }} />
+            <span style={{ fontSize: "9px", color: isRoot ? "#00ffa3" : "rgba(255,255,255,0.4)", fontFamily: "monospace" }}>
+              {NOTE_NAMES[i]}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
-function getScaleNotes(root, quality) {
-  const steps = quality === 'major' ? MAJOR_STEPS : MINOR_STEPS;
-  return steps.map(s => ({ pc: (root+s)%12, isRoot: s===0 }));
+// ── Main App ──────────────────────────────────────────────────────────────────
+export default function KeyDetector() {
+  const [isListening, setIsListening] = useState(false);
+  const [currentNote, setCurrentNote] = useState(null);
+  const [currentFreq, setCurrentFreq] = useState(null);
+  const [detectedKey, setDetectedKey] = useState(null);
+  const [confidence, setConfidence] = useState(0);
+  const [histogram, setHistogram] = useState(new Array(12).fill(0));
+  const [noteHistory, setNoteHistory] = useState([]);
+  const [error, setError] = useState(null);
+  const [sampleCount, setSampleCount] = useState(0);
+
+  const audioCtxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const sourceRef = useRef(null);
+  const scriptRef = useRef(null);
+  const histRef = useRef(new Array(12).fill(0));
+  const frameRef = useRef(null);
+
+  const WINDOW = 300; // pitch history window
+
+  const startListening = useCallback(async () => {
+    try {
+      setError(null);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      const source = ctx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      const processor = ctx.createScriptProcessor(2048, 1, 1);
+      analyser.connect(processor);
+      processor.connect(ctx.destination);
+
+      processor.onaudioprocess = (e) => {
+        const buffer = e.inputBuffer.getChannelData(0);
+        const freq = detectPitch(Array.from(buffer), ctx.sampleRate);
+
+        if (freq && freq > 60 && freq < 1200) {
+          const midi = freqToMidi(freq);
+          const pc = midiToPitchClass(midi);
+          const noteName = NOTE_NAMES[pc];
+
+          setCurrentFreq(freq.toFixed(1));
+          setCurrentNote(noteName + Math.floor(midi / 12 - 1));
+
+          histRef.current[pc] += 1;
+          const newHist = [...histRef.current];
+          setHistogram(newHist);
+
+          setSampleCount(s => {
+            const next = s + 1;
+            if (next >= 15) {
+              const key = estimateKey(newHist);
+              setDetectedKey(key);
+              setConfidence(Math.round(Math.max(0, Math.min(1, (key.score + 1) / 2)) * 100));
+            }
+            return next;
+          });
+
+          setNoteHistory(prev => {
+            const next = [...prev, noteName].slice(-WINDOW);
+            return next;
+          });
+        } else {
+          setCurrentNote(null);
+          setCurrentFreq(null);
+        }
+      };
+
+      audioCtxRef.current = ctx;
+      analyserRef.current = analyser;
+      sourceRef.current = source;
+      scriptRef.current = processor;
+      setIsListening(true);
+    } catch (err) {
+      setError(err.message.includes("Permission") || err.name === "NotAllowedError"
+        ? "Microphone access denied. Please allow mic permission and try again."
+        : `Error: ${err.message}`);
+    }
+  }, []);
+
+  const stopListening = useCallback(() => {
+    scriptRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    audioCtxRef.current?.close();
+    cancelAnimationFrame(frameRef.current);
+    setIsListening(false);
+    setCurrentNote(null);
+    setCurrentFreq(null);
+  }, []);
+
+  const resetDetection = () => {
+    histRef.current = new Array(12).fill(0);
+    setHistogram(new Array(12).fill(0));
+    setDetectedKey(null);
+    setConfidence(0);
+    setNoteHistory([]);
+    setSampleCount(0);
+  };
+
+  useEffect(() => () => stopListening(), [stopListening]);
+
+  const keyLabel = detectedKey
+    ? `${NOTE_NAMES[detectedKey.root]} ${detectedKey.quality}`
+    : "—";
+
+  const relativeKey = detectedKey
+    ? detectedKey.quality === "major"
+      ? `Rel. minor: ${NOTE_NAMES[(detectedKey.root + 9) % 12]}m`
+      : `Rel. major: ${NOTE_NAMES[(detectedKey.root + 3) % 12]}`
+    : null;
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "#080c10",
+      color: "#e8edf2",
+      fontFamily: "'Courier New', 'Lucida Console', monospace",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      padding: "32px 16px",
+      position: "relative",
+      overflow: "hidden"
+    }}>
+      {/* Background grid */}
+      <div style={{
+        position: "fixed", inset: 0, zIndex: 0,
+        backgroundImage: "linear-gradient(rgba(0,255,163,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(0,255,163,0.03) 1px, transparent 1px)",
+        backgroundSize: "40px 40px"
+      }} />
+
+      {/* Glow orb */}
+      <div style={{
+        position: "fixed", top: "-100px", left: "50%", transform: "translateX(-50%)",
+        width: "600px", height: "400px",
+        background: "radial-gradient(ellipse, rgba(0,212,255,0.06) 0%, transparent 70%)",
+        zIndex: 0, pointerEvents: "none"
+      }} />
+
+      <div style={{ position: "relative", zIndex: 1, width: "100%", maxWidth: "640px" }}>
+
+        {/* Header */}
+        <div style={{ textAlign: "center", marginBottom: "36px" }}>
+          <div style={{ fontSize: "11px", letterSpacing: "6px", color: "#00ffa3", marginBottom: "8px", textTransform: "uppercase" }}>
+            ◈ Live Audio Analysis
+          </div>
+          <h1 style={{
+            fontSize: "clamp(32px, 6vw, 52px)", fontWeight: "900", margin: 0,
+            background: "linear-gradient(135deg, #ffffff 30%, #00ffa3 100%)",
+            WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+            letterSpacing: "-2px"
+          }}>
+            KEY DETECTOR
+          </h1>
+          <p style={{ color: "rgba(255,255,255,0.3)", fontSize: "12px", marginTop: "8px", letterSpacing: "2px" }}>
+            REAL-TIME VOCAL KEY IDENTIFICATION
+          </p>
+        </div>
+
+        {/* Error */}
+        {error && (
+          <div style={{
+            background: "rgba(255,80,80,0.1)", border: "1px solid rgba(255,80,80,0.3)",
+            borderRadius: "8px", padding: "12px 16px", marginBottom: "20px",
+            fontSize: "13px", color: "#ff8080"
+          }}>
+            ⚠ {error}
+          </div>
+        )}
+
+        {/* Key display */}
+        <div style={{
+          background: "rgba(255,255,255,0.03)", border: "1px solid rgba(0,255,163,0.15)",
+          borderRadius: "16px", padding: "32px 24px", marginBottom: "20px", textAlign: "center",
+          position: "relative", overflow: "hidden"
+        }}>
+          {detectedKey && (
+            <div style={{
+              position: "absolute", inset: 0,
+              background: "radial-gradient(ellipse at center, rgba(0,255,163,0.04) 0%, transparent 70%)",
+              pointerEvents: "none"
+            }} />
+          )}
+
+          <div style={{ fontSize: "11px", letterSpacing: "4px", color: "rgba(255,255,255,0.3)", marginBottom: "12px" }}>
+            DETECTED KEY
+          </div>
+
+          <div style={{
+            fontSize: "clamp(48px, 12vw, 80px)", fontWeight: "900", lineHeight: 1,
+            color: detectedKey ? "#00ffa3" : "rgba(255,255,255,0.15)",
+            textShadow: detectedKey ? "0 0 40px rgba(0,255,163,0.4)" : "none",
+            transition: "all 0.4s ease",
+            letterSpacing: "-3px"
+          }}>
+            {keyLabel}
+          </div>
+
+          {relativeKey && (
+            <div style={{ fontSize: "13px", color: "rgba(0,212,255,0.7)", marginTop: "8px", letterSpacing: "2px" }}>
+              {relativeKey}
+            </div>
+          )}
+
+          {/* Confidence bar */}
+          <div style={{ marginTop: "20px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "rgba(255,255,255,0.3)", marginBottom: "6px", letterSpacing: "2px" }}>
+              <span>CONFIDENCE</span>
+              <span>{confidence}%</span>
+            </div>
+            <div style={{ height: "4px", background: "rgba(255,255,255,0.08)", borderRadius: "4px", overflow: "hidden" }}>
+              <div style={{
+                height: "100%",
+                width: `${confidence}%`,
+                background: confidence > 70 ? "linear-gradient(90deg,#00ffa3,#00d4ff)" : confidence > 40 ? "#f0c040" : "#ff6060",
+                borderRadius: "4px",
+                transition: "width 0.5s ease, background 0.5s ease",
+                boxShadow: confidence > 70 ? "0 0 8px rgba(0,255,163,0.6)" : "none"
+              }} />
+            </div>
+          </div>
+        </div>
+
+        {/* Live note + freq */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "20px" }}>
+          <div style={{
+            background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: "12px", padding: "16px", textAlign: "center"
+          }}>
+            <div style={{ fontSize: "10px", letterSpacing: "3px", color: "rgba(255,255,255,0.3)", marginBottom: "8px" }}>CURRENT NOTE</div>
+            <div style={{ fontSize: "28px", fontWeight: "700", color: currentNote ? "#00d4ff" : "rgba(255,255,255,0.15)" }}>
+              {currentNote || "·"}
+            </div>
+          </div>
+          <div style={{
+            background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: "12px", padding: "16px", textAlign: "center"
+          }}>
+            <div style={{ fontSize: "10px", letterSpacing: "3px", color: "rgba(255,255,255,0.3)", marginBottom: "8px" }}>FREQUENCY</div>
+            <div style={{ fontSize: "28px", fontWeight: "700", color: currentFreq ? "#00d4ff" : "rgba(255,255,255,0.15)" }}>
+              {currentFreq ? `${currentFreq}` : "·"}
+              {currentFreq && <span style={{ fontSize: "12px", color: "rgba(0,212,255,0.5)", marginLeft: "3px" }}>Hz</span>}
+            </div>
+          </div>
+        </div>
+
+        {/* Waveform */}
+        <div style={{ marginBottom: "20px" }}>
+          <div style={{ fontSize: "10px", letterSpacing: "3px", color: "rgba(255,255,255,0.3)", marginBottom: "8px" }}>WAVEFORM</div>
+          <WaveformCanvas analyserRef={analyserRef} isListening={isListening} />
+        </div>
+
+        {/* Chromagram */}
+        <div style={{
+          background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
+          borderRadius: "12px", padding: "16px", marginBottom: "20px"
+        }}>
+          <div style={{ fontSize: "10px", letterSpacing: "3px", color: "rgba(255,255,255,0.3)", marginBottom: "12px" }}>
+            PITCH CLASS HISTOGRAM &nbsp;
+            <span style={{ color: "rgba(0,255,163,0.5)" }}>{sampleCount} samples</span>
+          </div>
+          <Chromagram histogram={histogram} detectedKey={detectedKey} />
+        </div>
+
+        {/* Controls */}
+        <div style={{ display: "flex", gap: "12px" }}>
+          <button
+            onClick={isListening ? stopListening : startListening}
+            style={{
+              flex: 2,
+              padding: "16px",
+              borderRadius: "12px",
+              border: "none",
+              cursor: "pointer",
+              fontSize: "13px",
+              fontWeight: "700",
+              letterSpacing: "3px",
+              fontFamily: "inherit",
+              transition: "all 0.2s ease",
+              background: isListening
+                ? "linear-gradient(135deg, rgba(255,80,80,0.2), rgba(255,80,80,0.1))"
+                : "linear-gradient(135deg, rgba(0,255,163,0.2), rgba(0,212,255,0.1))",
+              color: isListening ? "#ff8080" : "#00ffa3",
+              border: `1px solid ${isListening ? "rgba(255,80,80,0.3)" : "rgba(0,255,163,0.3)"}`,
+              boxShadow: isListening ? "0 0 20px rgba(255,80,80,0.1)" : "0 0 20px rgba(0,255,163,0.1)"
+            }}
+          >
+            {isListening ? "⏹ STOP" : "⏺ START LISTENING"}
+          </button>
+
+          <button
+            onClick={resetDetection}
+            style={{
+              flex: 1,
+              padding: "16px",
+              borderRadius: "12px",
+              border: "1px solid rgba(255,255,255,0.1)",
+              cursor: "pointer",
+              fontSize: "13px",
+              fontWeight: "700",
+              letterSpacing: "2px",
+              fontFamily: "inherit",
+              background: "rgba(255,255,255,0.04)",
+              color: "rgba(255,255,255,0.4)",
+              transition: "all 0.2s ease"
+            }}
+          >
+            ↺ RESET
+          </button>
+        </div>
+
+        {/* Instructions */}
+        {!isListening && !detectedKey && (
+          <div style={{ textAlign: "center", marginTop: "24px", color: "rgba(255,255,255,0.2)", fontSize: "12px", letterSpacing: "1px", lineHeight: "1.8" }}>
+            Press START LISTENING, allow microphone access,<br />
+            then sing or hum — the key will be detected<br />
+            after a few seconds of varied notes.
+          </div>
+        )}
+
+        <div style={{ textAlign: "center", marginTop: "32px", fontSize: "10px", color: "rgba(255,255,255,0.1)", letterSpacing: "2px" }}>
+          POWERED BY YIN PITCH DETECTION · KRUMHANSL-SCHMUCKLER KEY PROFILES
+        </div>
+      </div>
+    </div>
+  );
 }
-
-function getChordsInKey(root, quality) {
-  const offsets = quality === 'major' ? CHORD_OFFSETS_MAJ : CHORD_OFFSETS_MIN;
-  const chords  = quality === 'major' ? MAJOR_CHORDS : MINOR_CHORDS;
-  return offsets.map((off, i) => {
-    const notePc = (root+off)%12;
-    const noteName = formatNoteName(notePc);
-    const [roman, type] = chords[i];
-    const suffix = type === 'min' ? 'm' : type === 'dim' ? '°' : '';
-    return { name: noteName+suffix, roman };
-  });
-}
-
-function renderKey(root, quality, confidence, stability) {
-  const rootName = formatNoteName(root);
-  const qualLabel = quality === 'major' ? 'Major' : 'Minor';
-  const combined = Math.round((confidence * 0.6) + (stability * 0.4));
-
-  keyName.textContent = rootName;
-  keyName.className = 'key-name has-key';
-  keyQuality.textContent = qualLabel;
-  keyDisplay.classList.add('active');
-
-  confFill.style.width = combined + '%';
-  confVal.textContent = combined + '%';
-
-  // Scale notes
-  const notes = getScaleNotes(root, quality);
-  scaleNotes.innerHTML = notes.map(({pc, isRoot}) =>
-    `<span class="note-pill${isRoot?' root':''}">${formatNoteName(pc)}</span>`
-  ).join('');
-
-  // Chords
-  const chords = getChordsInKey(root, quality);
-  chordList.innerHTML = chords.map(({name,roman}) =>
-    `<div class="chord-item"><span class="chord-name">${name}</span><span class="chord-roman">${roman}</span></div>`
-  ).join('');
-}
-
-function renderChromagram(chroma) {
-  const maxH = 56;
-  for (let i=0;i<12;i++) {
-    const h = Math.max(2, Math.round(chroma[i]*maxH));
-    chromaBarEls[i].style.height = h+'px';
-  }
-}
-
-function highlightChromaKey(root, quality) {
-  const steps = quality === 'major' ? MAJOR_STEPS : MINOR_STEPS;
-  const inKey = new Set(steps.map(s => (root+s)%12));
-  for (let i=0;i<12;i++){
-    const active = inKey.has(i);
-    chromaBarEls[i].classList.toggle('active', active);
-    chromaNoteEls[i].classList.toggle('active', active);
-  }
-}
-
-// ── History ───────────────────────────────────
-function addHistory(root, quality, confidence) {
-  const key = `${formatNoteName(root)} ${quality==='major'?'Major':'Minor'}`;
-  if (lastAddedKey === key) return;
-  lastAddedKey = key;
-
-  const now = new Date();
-  const time = now.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  sessionHistory.unshift({ key, confidence, time });
-  if (sessionHistory.length > 10) sessionHistory.pop();
-
-  if (sessionHistory.length === 1) {
-    historyList.innerHTML = '';
-  }
-  historyList.innerHTML = sessionHistory.map(h =>
-    `<div class="history-item">
-      <span class="hist-key">${h.key}</span>
-      <span class="hist-meta">${h.confidence}% · ${h.time}</span>
-    </div>`
-  ).join('');
-}
-
-// ── WAVEFORM DRAW ─────────────────────────────
-function drawWaveform(timeDomain) {
-  wCtx.clearRect(0,0,WW,WH);
-  wCtx.beginPath();
-  wCtx.strokeStyle = isListening ? '#00e5a0' : '#333344';
-  wCtx.lineWidth = 1.5;
-  const sliceW = WW / timeDomain.length;
-  let x = 0;
-  for (let i=0;i<timeDomain.length;i++){
-    const v = timeDomain[i]/128;
-    const y = (v * WH/2);
-    if (i===0) wCtx.moveTo(x,y);
-    else wCtx.lineTo(x,y);
-    x += sliceW;
-  }
-  wCtx.stroke();
-}
-
-// ── MAIN LOOP ─────────────────────────────────
-let freqData = null, timeData = null;
-
-function loop() {
-  if (!analyser) return;
-  animFrame = requestAnimationFrame(loop);
-
-  analyser.getFloatFrequencyData(freqData);
-  analyser.getByteTimeDomainData(timeData);
-
-  drawWaveform(timeData);
-
-  if (isLocked) return;
-
-  const raw = buildChromagram(freqData, audioCtx.sampleRate, analyser.fftSize);
-  smoothChromaUpdate(raw);
-  renderChromagram(smoothChroma);
-
-  const result = detectKey(smoothChroma);
-  if (result.confidence < 10) return;
-
-  const stable = stableKey(result);
-  renderKey(stable.root, stable.quality, stable.rawConfidence, stable.stability);
-  highlightChromaKey(stable.root, stable.quality);
-
-  if (stable.stability >= 60 && stable.rawConfidence >= 40) {
-    addHistory(stable.root, stable.quality, stable.rawConfidence);
-  }
-}
-
-// ── CONTROLS ──────────────────────────────────
-async function toggleListen() {
-  if (isListening) {
-    stopListening();
-  } else {
-    await startListening();
-  }
-}
-
-async function startListening() {
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const source = audioCtx.createMediaStreamSource(stream);
-
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 8192;
-    analyser.smoothingTimeConstant = 0.6;
-    source.connect(analyser);
-
-    freqData = new Float32Array(analyser.frequencyBinCount);
-    timeData = new Uint8Array(analyser.fftSize);
-
-    isListening = true;
-    startBtn.textContent = 'Stop';
-    startBtn.classList.add('recording');
-    startBtn.classList.remove('btn-primary');
-    lockBtn.disabled = false;
-    statusDot.className = 'status-dot live';
-    statusText.textContent = 'listening — detecting key…';
-
-    loop();
-  } catch(e) {
-    statusText.textContent = 'microphone access denied';
-    console.error(e);
-  }
-}
-
-function stopListening() {
-  if (animFrame) cancelAnimationFrame(animFrame);
-  if (stream) stream.getTracks().forEach(t => t.stop());
-  if (audioCtx) audioCtx.close();
-  analyser = null; audioCtx = null; stream = null;
-  isListening = false; isLocked = false;
-  detectionBuffer = []; lastAddedKey = null;
-  smoothChroma.fill(0);
-
-  startBtn.textContent = 'Start Listening';
-  startBtn.classList.remove('recording');
-  startBtn.classList.add('btn-primary');
-  lockBtn.textContent = 'Hold Key';
-  lockBtn.disabled = true;
-  statusDot.className = 'status-dot';
-  statusText.textContent = 'tap start to begin listening';
-  lockedBadge.classList.remove('show');
-  keyDisplay.classList.remove('active');
-  keyName.textContent = '—';
-  keyName.className = 'key-name';
-  keyQuality.textContent = '';
-  confFill.style.width = '0%';
-  confVal.textContent = '0%';
-  scaleNotes.innerHTML = '<span class="note-pill">—</span>';
-  chordList.innerHTML = '<div class="chord-item"><span class="chord-name" style="color:var(--text3)">—</span></div>';
-  for(let i=0;i<12;i++){
-    chromaBarEls[i].style.height='2px';
-    chromaBarEls[i].classList.remove('active');
-    chromaNoteEls[i].classList.remove('active');
-  }
-  wCtx.clearRect(0,0,WW,WH);
-}
-
-function toggleLock() {
-  if (!isListening) return;
-  isLocked = !isLocked;
-  if (isLocked) {
-    lockBtn.textContent = 'Unlock';
-    statusDot.className = 'status-dot locked';
-    statusText.textContent = 'key locked';
-    lockedBadge.classList.add('show');
-  } else {
-    lockBtn.textContent = 'Hold Key';
-    statusDot.className = 'status-dot live';
-    statusText.textContent = 'listening — detecting key…';
-    lockedBadge.classList.remove('show');
-    detectionBuffer = [];
-    lastAddedKey = null;
-  }
-}
-
-// Resize canvas on window resize
-window.addEventListener('resize', () => {
-  waveCanvas.width  = waveCanvas.offsetWidth  * dpr;
-  waveCanvas.height = waveCanvas.offsetHeight * dpr;
-  wCtx.scale(dpr,dpr);
-});
-</script>
-</body>
-</html>

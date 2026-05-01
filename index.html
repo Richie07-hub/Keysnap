@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>KeySnap — Live Key Detector</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!-- Essentia.js Library -->
+<script src="https://cdn.jsdelivr.net/npm/essentia.js@0.1.15/dist/essentia-wasm.umd.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -382,6 +384,35 @@
     display: none;
   }
   .locked-badge.show { display: inline-block; }
+
+  /* ── ALGORITHM TOGGLE ── */
+  .algo-toggle {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    padding: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    justify-content: center;
+  }
+  .algo-btn {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text2);
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: var(--font-mono);
+    transition: all 0.2s;
+  }
+  .algo-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #000;
+    font-weight: 600;
+  }
 </style>
 </head>
 <body>
@@ -401,6 +432,12 @@
     <span class="status-dot" id="statusDot"></span>
     <span id="statusText">tap start to begin listening</span>
     <span class="locked-badge" id="lockedBadge">LOCKED</span>
+  </div>
+
+  <!-- Algorithm Toggle -->
+  <div class="algo-toggle">
+    <button class="algo-btn active" id="algoClassic" onclick="setAlgorithm('classic')">Classic</button>
+    <button class="algo-btn" id="algoEssentia" onclick="setAlgorithm('essentia')">Essentia.js</button>
   </div>
 
   <!-- Big key display -->
@@ -456,8 +493,8 @@
 
 <script>
 // ═══════════════════════════════════════════════
-//  KEYSNAP — Musical Key Detection Algorithm
-//  Method: Chromagram + Krumhansl-Schmuckler
+//  KEYSNAP — Musical Key Detection
+//  Methods: Essentia.js + Krumhansl-Schmuckler
 // ═══════════════════════════════════════════════
 
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
@@ -488,9 +525,12 @@ let audioCtx = null, analyser = null, stream = null;
 let animFrame = null, isListening = false, isLocked = false;
 let lockedKey = null;
 let smoothChroma = new Float32Array(12).fill(0);
-let detectionBuffer = []; // rolling last 1s of detections
+let detectionBuffer = [];
 let lastAddedKey = null;
 let sessionHistory = [];
+let useEssentia = false;
+let essentia = null;
+let essentiaInitialized = false;
 
 // ── DOM ──
 const startBtn = document.getElementById('startBtn');
@@ -508,6 +548,8 @@ const lockedBadge = document.getElementById('lockedBadge');
 const keyDisplay = document.getElementById('keyDisplay');
 const waveCanvas = document.getElementById('waveCanvas');
 const chromaBarsEl = document.getElementById('chromaBars');
+const algoClassicBtn = document.getElementById('algoClassic');
+const algoEssentiaBtn = document.getElementById('algoEssentia');
 
 // Build chromagram bars
 let chromaBarEls = [], chromaNoteEls = [];
@@ -536,13 +578,39 @@ wCtx.scale(dpr, dpr);
 const WW = waveCanvas.offsetWidth;
 const WH = waveCanvas.offsetHeight;
 
-// ── STEP 1: FFT → Chromagram ──────────────────
+// ── ESSENTIA.JS SETUP ─────────────────────────
+async function initEssentia() {
+  try {
+    if (typeof Essentia === 'undefined' || typeof Essentia.default === 'undefined') {
+      statusText.textContent = 'Essentia.js loading...';
+      await new Promise(resolve => {
+        const checkInterval = setInterval(() => {
+          if (typeof Essentia !== 'undefined' && typeof Essentia.default !== 'undefined') {
+            clearInterval(checkInterval);
+            resolve();
+          }
+        }, 100);
+      });
+    }
+    essentia = new Essentia.default();
+    essentia.setExtractor({ key: 'true' });
+    essentiaInitialized = true;
+    statusText.textContent = 'Essentia.js ready';
+    console.log('✓ Essentia.js initialized');
+  } catch(e) {
+    console.error('Failed to initialize Essentia.js:', e);
+    statusText.textContent = 'Essentia.js initialization failed';
+    useEssentia = false;
+    algoEssentiaBtn.disabled = true;
+  }
+}
+
+// ── CLASSIC METHOD: FFT → Chromagram ──────────
 function buildChromagram(floatFreqData, sampleRate, fftSize) {
   const chroma = new Float32Array(12).fill(0);
   const nyquist = sampleRate / 2;
   const binWidth = nyquist / (fftSize / 2);
 
-  // C2 to B6 — musically useful range
   const freqMin = 65.41;
   const freqMax = 1975.53;
 
@@ -550,20 +618,47 @@ function buildChromagram(floatFreqData, sampleRate, fftSize) {
     const freq = i * binWidth;
     if (freq < freqMin || freq > freqMax) continue;
 
-    // Convert power (dB) to linear amplitude
     const amp = Math.pow(10, floatFreqData[i] / 20);
     if (amp < 1e-6) continue;
 
-    // Map freq → MIDI note → pitch class (0–11)
     const midi = 12 * Math.log2(freq / 440) + 69;
     const pc   = ((Math.round(midi) % 12) + 12) % 12;
     chroma[pc] += amp;
   }
 
-  // Normalize 0–1
   const maxVal = Math.max(...chroma, 1e-9);
   for (let i = 0; i < 12; i++) chroma[i] /= maxVal;
   return chroma;
+}
+
+// ── ESSENTIA METHOD: Built-in Chromagram ─────
+function buildChromagramEssentia(floatFreqData, sampleRate) {
+  try {
+    if (!essentiaInitialized || !essentia) return buildChromagram(floatFreqData, sampleRate, 8192);
+    
+    // Convert frequency data to input format expected by Essentia
+    const input = new Float32Array(floatFreqData.length);
+    for (let i = 0; i < floatFreqData.length; i++) {
+      input[i] = Math.pow(10, floatFreqData[i] / 20);
+    }
+
+    // Use Essentia's chromagram computation
+    const chromagram = essentia.chromagram(input, sampleRate);
+    const chroma = new Float32Array(12);
+    
+    if (chromagram && chromagram.length >= 12) {
+      for (let i = 0; i < 12; i++) {
+        chroma[i] = chromagram[i] || 0;
+      }
+    }
+    
+    const maxVal = Math.max(...chroma, 1e-9);
+    for (let i = 0; i < 12; i++) chroma[i] /= maxVal;
+    return chroma;
+  } catch(e) {
+    console.warn('Essentia chromagram failed, falling back:', e);
+    return buildChromagram(floatFreqData, sampleRate, 8192);
+  }
 }
 
 // ── STEP 2: Smooth chromagram (EMA) ──────────
@@ -592,7 +687,6 @@ function detectKey(chroma) {
   let bestScore = -Infinity, bestRoot = 0, bestQuality = 'major';
 
   for (let root = 0; root < 12; root++) {
-    // Rotate chroma to align with this root
     const rotated = [];
     for (let i=0;i<12;i++) rotated.push(chroma[(i+root)%12]);
 
@@ -603,7 +697,6 @@ function detectKey(chroma) {
     if (minScore > bestScore) { bestScore=minScore; bestRoot=root; bestQuality='minor'; }
   }
 
-  // Confidence: map score (typically 0.5–1.0) → 0–100%
   const confidence = Math.min(100, Math.max(0, Math.round((bestScore - 0.3) / 0.7 * 100)));
   return { root: bestRoot, quality: bestQuality, score: bestScore, confidence };
 }
@@ -658,13 +751,11 @@ function renderKey(root, quality, confidence, stability) {
   confFill.style.width = combined + '%';
   confVal.textContent = combined + '%';
 
-  // Scale notes
   const notes = getScaleNotes(root, quality);
   scaleNotes.innerHTML = notes.map(({pc, isRoot}) =>
     `<span class="note-pill${isRoot?' root':''}">${formatNoteName(pc)}</span>`
   ).join('');
 
-  // Chords
   const chords = getChordsInKey(root, quality);
   chordList.innerHTML = chords.map(({name,roman}) =>
     `<div class="chord-item"><span class="chord-name">${name}</span><span class="chord-roman">${roman}</span></div>`
@@ -743,7 +834,10 @@ function loop() {
 
   if (isLocked) return;
 
-  const raw = buildChromagram(freqData, audioCtx.sampleRate, analyser.fftSize);
+  const raw = useEssentia ? 
+    buildChromagramEssentia(freqData, audioCtx.sampleRate) : 
+    buildChromagram(freqData, audioCtx.sampleRate, analyser.fftSize);
+  
   smoothChromaUpdate(raw);
   renderChromagram(smoothChroma);
 
@@ -757,6 +851,19 @@ function loop() {
   if (stable.stability >= 60 && stable.rawConfidence >= 40) {
     addHistory(stable.root, stable.quality, stable.rawConfidence);
   }
+}
+
+// ── ALGORITHM TOGGLE ──────────────────────────
+function setAlgorithm(algo) {
+  if (algo === 'essentia' && !essentiaInitialized) {
+    statusText.textContent = 'Initializing Essentia.js...';
+    initEssentia();
+    return;
+  }
+  
+  useEssentia = algo === 'essentia';
+  algoClassicBtn.classList.toggle('active', algo === 'classic');
+  algoEssentiaBtn.classList.toggle('active', algo === 'essentia');
 }
 
 // ── CONTROLS ──────────────────────────────────
@@ -788,7 +895,7 @@ async function startListening() {
     startBtn.classList.remove('btn-primary');
     lockBtn.disabled = false;
     statusDot.className = 'status-dot live';
-    statusText.textContent = 'listening — detecting key…';
+    statusText.textContent = `listening — ${useEssentia ? 'essentia' : 'classic'} mode`;
 
     loop();
   } catch(e) {
@@ -841,7 +948,7 @@ function toggleLock() {
   } else {
     lockBtn.textContent = 'Hold Key';
     statusDot.className = 'status-dot live';
-    statusText.textContent = 'listening — detecting key…';
+    statusText.textContent = `listening — ${useEssentia ? 'essentia' : 'classic'} mode`;
     lockedBadge.classList.remove('show');
     detectionBuffer = [];
     lastAddedKey = null;
@@ -853,6 +960,11 @@ window.addEventListener('resize', () => {
   waveCanvas.width  = waveCanvas.offsetWidth  * dpr;
   waveCanvas.height = waveCanvas.offsetHeight * dpr;
   wCtx.scale(dpr,dpr);
+});
+
+// Initialize Essentia on page load
+window.addEventListener('load', () => {
+  initEssentia();
 });
 </script>
 </body>
